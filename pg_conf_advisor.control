@@ -1,0 +1,5 @@
+# pg_conf_advisor extension
+comment = 'Configuration advice for PostgreSQL based on system resources'
+default_version = '1.0'
+module_pathname = '$libdir/pg_conf_advisor'
+relocatable = true
