@@ -12,10 +12,37 @@
 
 PG_MODULE_MAGIC;
 
+typedef enum pgca_var_type
+{
+    PGCA_INT = 0,
+    PGCA_DOUBLE,
+    PGCA_BOOL,
+    PGCA_UNSUPPORTED
+} pgca_var_type;
+
+typedef struct pgca_conf_data
+{
+    char *name;
+    int index;
+    pgca_var_type var_type;
+} pgca_conf_data;
+
+typedef struct pgca_sys_resources
+{
+    uint32 cpus;
+    uint32 cpu_cores;
+    uint64 total_ram;
+    uint64 free_ram;
+    uint64 total_disk_space;
+    uint64 free_disk_space;
+    float percentage_free_ram;
+    float percentage_free_disk_space;  
+} pgca_sys_resources;
+
 typedef struct pgca_cost_data
 {
-	Cost		seq_page_cost;
-	Cost		random_page_cost;
+	Cost		seq_page_cost;      /* 1.0 default */
+	Cost		random_page_cost;   /* 1.1 */
 	Cost		cpu_tuple_cost;
 	Cost		cpu_index_tuple_cost;
 	Cost		cpu_operator_cost;
@@ -32,149 +59,165 @@ typedef struct pgca_mem_data
 	double		autovacuum_work_mem;
 } pgca_mem_data;
 
+// #checkpoint_timeout = 5min		# range 30s-1d
+// => Change default to 30mins
+// #checkpoint_completion_target = 0.9	# checkpoint target duration, 0.0 - 1.0
+// #checkpoint_flush_after = 256kB		# measured in pages, 0 disables
+// #max_wal_size = 2GB
+// 
 
-PG_FUNCTION_INFO_V1(get_system_info);
-PG_FUNCTION_INFO_V1(pg_sysinfo);
+#define SHARED_BUFFERS "shared_buffers"
+#define RANDOM_PAGE_COST "random_page_cost"
+
+#define NUM_PG_SETTINGS_ATTS 17
+#define PGCA_NUM_ATTS     3
+
+#define PGCA_MAX_UNIT_LEN 3
+
+/* GLOBAL VARIABLES */
+pgca_sys_resources sys_res;
+List *pgca_conf_list;
+
+void _PG_init(void);
+
+PG_FUNCTION_INFO_V1(pgca_get_system_info);
 PG_FUNCTION_INFO_V1(pg_conf_advisor);
-PG_FUNCTION_INFO_V1(pg_conf_advisor_set_params);
+// PG_FUNCTION_INFO_V1(pg_conf_advisor_set_params);
 
-static void get_cpu_info(int *p_cpu_count, int *p_core_count);
+static void pgca_get_cpu_info(void);
+static void pgca_get_mem_info(void);
+static void pgca_get_disk_info(char *config_data_path);
+
+static char* SuggestedSharedBuffer(char *str_value);
+
+static void pgca_parse_int_units(int *i, char *unit, char* str_value);
+static char* pgca_double_to_text(double d);
+// static char* pgca_int_to_text(int i);
+static char* pgca_int_unit_to_text(int i, char *unit);
 
 
+void
+_PG_init(void)
+{
+    MemoryContext oldcxt;
+    pgca_conf_data *conf_data;
+    ListCell *lc = NULL;
+    int i;
+    int num_config;
+
+    oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+    conf_data = (pgca_conf_data *) palloc0(sizeof(pgca_conf_data));
+    conf_data->name = palloc0(NAMEDATALEN);
+    snprintf(conf_data->name, NAMEDATALEN, SHARED_BUFFERS);
+    pgca_conf_list = lappend(pgca_conf_list, conf_data);
+
+    conf_data = (pgca_conf_data *) palloc0(sizeof(pgca_conf_data));
+    conf_data->name = palloc0(NAMEDATALEN);
+    snprintf(conf_data->name, NAMEDATALEN, RANDOM_PAGE_COST);
+    pgca_conf_list = lappend(pgca_conf_list, conf_data);
+
+    num_config = GetNumConfigOptions();
+    for(i = 0; i < num_config; i++)
+    {
+        char *pg_conf_values[NUM_PG_SETTINGS_ATTS];
+        bool noshow;
+
+        GetConfigOptionByNum(i, (const char **)pg_conf_values, &noshow);
+
+        foreach(lc, pgca_conf_list)
+        {
+            pgca_conf_data *d = (pgca_conf_data *) lfirst(lc);
+
+            if (strcmp(pg_conf_values[0], d->name) == 0)
+            {
+                d->index = i;
+
+                if (strcmp(pg_conf_values[7], "integer") == 0)
+                    d->var_type = PGCA_INT;
+                else if (strcmp(pg_conf_values[7], "real") == 0)
+                    d->var_type = PGCA_DOUBLE;
+                else if (strcmp(pg_conf_values[7], "bool") == 0)
+                    d->var_type = PGCA_BOOL;
+                else
+                    d->var_type = PGCA_UNSUPPORTED;
+            }
+        }
+    }
+
+    MemoryContextSwitchTo(oldcxt);
+}
 
 Datum
 pg_conf_advisor(PG_FUNCTION_ARGS)
 {
-    // Insert your code to read CPU, RAM, and disk space information
-    // and retrieve PostgreSQL configuration parameter values here.
+    char *config_data_path = ".";
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    // TupleDesc tupdesc;
+    ListCell *lc = NULL;
 
-    // Return the result as a text value.
-    PG_RETURN_TEXT_P(cstring_to_text("Your configuration advice goes here."));
-}
+    InitMaterializedSRF(fcinfo, 0);
 
-Datum
-pg_conf_advisor_set_params(PG_FUNCTION_ARGS)
-{
-    char *params = text_to_cstring(PG_GETARG_TEXT_P(0));
-}
+    pgca_get_cpu_info();
+    pgca_get_mem_info();
+    pgca_get_disk_info(config_data_path);
 
-Datum
-pg_sysinfo(PG_FUNCTION_ARGS)
-{
-    FuncCallContext *funcctx;
-    int call_cntr;
-    int max_calls;
-    TupleDesc tupdesc;
-    AttInMetadata *attinmeta;
-
-    // Initialize function context
-    if (SRF_IS_FIRSTCALL())
+    foreach(lc, pgca_conf_list)
     {
-        MemoryContext oldcontext;
+        int i = 0;
+        Datum values[PGCA_NUM_ATTS];
+        bool nulls[PGCA_NUM_ATTS] = {false, false, false};
+        pgca_conf_data *conf_data;
+        char *str_value = NULL;
+        char *str_value_suggested = NULL;
 
-        funcctx = SRF_FIRSTCALL_INIT();
-        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+        conf_data = (pgca_conf_data *) lfirst(lc);
+        str_value = GetConfigOptionByName(conf_data->name, NULL, true);
 
-        // Initialize tuple descriptor
-        tupdesc = CreateTemplateTupleDesc(2);
-        TupleDescInitEntry(tupdesc, (AttrNumber)1, "parameter", TEXTOID, -1, 0);
-        TupleDescInitEntry(tupdesc, (AttrNumber)2, "value", TEXTOID, -1, 0);
+        // elog(INFO, "%s => %s", conf_data->name, str_value);
 
-        attinmeta = TupleDescGetAttInMetadata(tupdesc);
-        funcctx->attinmeta = attinmeta;
+        // if (strcmp(str_value, SHARED_BUFFERS) == 0)
+        // {
+        // elog(INFO, "1");
+        //     str_value_suggested = pstrdup(str_value); //SuggestedSharedBuffer(str_value);
+        // }
+        // else if (strcmp(str_value, RANDOM_PAGE_COST) == 0)
+        // {
+        // elog(INFO, "2");
+        //     str_value_suggested = pstrdup(str_value); //pgca_double_to_text(1.1);
+        // }
 
-        MemoryContextSwitchTo(oldcontext);
+        // elog(INFO, "%s => %d => %d => %d", conf_data->name, conf_data->index, NBuffers, (Size) BLCKSZ);
+        values[i++] = CStringGetTextDatum(conf_data->name);
+        values[i++] = CStringGetTextDatum(str_value);
+        // elog(INFO, "3 = %s", str_value_suggested);
+        values[i++] = CStringGetTextDatum(str_value);
+        // elog(INFO, "4");
+
+        tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
     }
 
-    funcctx = SRF_PERCALL_SETUP();
-    call_cntr = funcctx->call_cntr;
-    max_calls = 4;
-    attinmeta = funcctx->attinmeta;
-
-    // Process and return system information
-    if (call_cntr < max_calls)
-    {
-        struct sysinfo sys_info;
-        struct statvfs stat;
-
-        char *values[2];
-        HeapTuple tuple;
-        Datum result;
-
-        sysinfo(&sys_info);
-        statvfs("/", &stat);
-
-        switch (call_cntr)
-        {
-            case 0:
-                values[0] = "CPU cores";
-                values[1] = psprintf("%d", get_nprocs());
-                break;
-            case 1:
-                values[0] = "RAM (MB)";
-                values[1] = psprintf("%lu", sys_info.totalram / 1024 / 1024);
-                break;
-            case 2:
-                values[0] = "Disk space (MB)";
-                values[1] = psprintf("%lu", (stat.f_blocks * stat.f_frsize) / (1024 * 1024));
-                break;
-            case 3:
-                values[0] = "Free disk space (MB)";
-                values[1] = psprintf("%lu", (stat.f_bavail * stat.f_frsize) / (1024 * 1024));
-                break;
-        }
-
-        tuple = BuildTupleFromCStrings(attinmeta, values);
-        result = HeapTupleGetDatum(tuple);
-
-        SRF_RETURN_NEXT(funcctx, result);
-    }
-    else
-    {
-        SRF_RETURN_DONE(funcctx);
-    }
+    return (Datum) 0;
 }
 
+// Datum
+// pg_conf_advisor_set_params(PG_FUNCTION_ARGS)
+// {
+//     char *params = text_to_cstring(PG_GETARG_TEXT_P(0));
+// }
+
 Datum
-get_system_info(PG_FUNCTION_ARGS)
+pgca_get_system_info(PG_FUNCTION_ARGS)
 {
-    struct sysinfo sys_info;
-    struct statvfs disk_info;
     char *config_data_path = text_to_cstring(PG_GETARG_TEXT_P(0));
-    int cpus;
-    int cpu_cores;
-    long total_ram;
-    long free_ram;
-    long total_disk_space;
-    long free_disk_space;
     TupleDesc tuple_desc;
-    AttInMetadata *attinmeta;
     HeapTuple tuple;
     Datum values[8];
-    bool nulls[8] = {false, false, false, false, false};
+    bool nulls[8] = {false};
 
-    elog(INFO, "shared_buffers = %s", GetConfigOptionByName("shared_buffers", NULL, true));
-
-    if (statvfs(config_data_path, &disk_info) == -1)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                 errmsg("failed to read disk information")));
-    }
-
-    if (sysinfo(&sys_info) == -1)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                 errmsg("failed to read system information")));
-    }
-
-    get_cpu_info(&cpus, &cpu_cores);
-
-    total_ram = sys_info.totalram;
-    free_ram = sys_info.freeram;
-    total_disk_space = disk_info.f_blocks * disk_info.f_frsize;
-    free_disk_space = disk_info.f_bfree * disk_info.f_frsize;
+    pgca_get_cpu_info();
+    pgca_get_mem_info();
+    pgca_get_disk_info(config_data_path);
 
     if (get_call_result_type(fcinfo, NULL, &tuple_desc) != TYPEFUNC_COMPOSITE)
     {
@@ -183,16 +226,14 @@ get_system_info(PG_FUNCTION_ARGS)
                  errmsg("function returning record called in context that cannot accept type record")));
     }
 
-    attinmeta = TupleDescGetAttInMetadata(tuple_desc);
-
-    values[0] = Int32GetDatum(cpus);
-    values[1] = Int32GetDatum(cpu_cores);
-    values[2] = Int64GetDatum(total_ram);
-    values[3] = Int64GetDatum(free_ram);
-    values[4] = Float4GetDatum((free_ram * 100.0) / total_ram);
-    values[5] = Int64GetDatum(total_disk_space);
-    values[6] = Int64GetDatum(free_disk_space);
-    values[7] = Float4GetDatum((free_disk_space * 100.0) / total_disk_space);
+    values[0] = Int32GetDatum(sys_res.cpus);
+    values[1] = Int32GetDatum(sys_res.cpu_cores);
+    values[2] = Int64GetDatum(sys_res.total_ram);
+    values[3] = Int64GetDatum(sys_res.free_ram);
+    values[4] = Float4GetDatum(sys_res.percentage_free_ram);
+    values[5] = Int64GetDatum(sys_res.total_disk_space);
+    values[6] = Int64GetDatum(sys_res.free_disk_space);
+    values[7] = Float4GetDatum(sys_res.percentage_free_disk_space);
 
     tuple = heap_form_tuple(tuple_desc, values, nulls);
 
@@ -200,7 +241,41 @@ get_system_info(PG_FUNCTION_ARGS)
 }
 
 void
-get_cpu_info(int *p_cpu_count, int *p_core_count)
+pgca_get_mem_info(void)
+{
+    struct sysinfo sys_info;
+
+    if (sysinfo(&sys_info) == -1)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                 errmsg("failed to read system information")));
+    }
+
+    sys_res.total_ram = sys_info.totalram;
+    sys_res.free_ram = sys_info.freeram;
+    sys_res.percentage_free_ram = (sys_res.free_ram * 100.0) / sys_res.total_ram;
+}
+
+void
+pgca_get_disk_info(char *config_data_path)
+{
+    struct statvfs disk_info;
+
+    if (statvfs(config_data_path, &disk_info) == -1)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                 errmsg("failed to read disk information")));
+    }
+
+    sys_res.total_disk_space = disk_info.f_blocks * disk_info.f_frsize;
+    sys_res.free_disk_space = disk_info.f_bfree * disk_info.f_frsize;
+    sys_res.percentage_free_disk_space = (sys_res.free_disk_space * 100.0) / sys_res.total_disk_space;
+}
+
+void
+pgca_get_cpu_info(void)
 {
     FILE *cpuinfo;
     char buffer[1024];
@@ -238,6 +313,102 @@ get_cpu_info(int *p_cpu_count, int *p_core_count)
         fclose(cpuinfo);
     }
 
-    *p_cpu_count = cpus;
-    *p_core_count = cores;
+    sys_res.cpus = cpus;
+    sys_res.cpu_cores = cores;
+}
+
+/*
+# Memory units:  B  = bytes            Time units:  us  = microseconds
+#                kB = kilobytes                     ms  = milliseconds
+#                MB = megabytes                     s   = seconds
+#                GB = gigabytes                     min = minutes
+#                TB = terabytes                     h   = hours
+#                                                   d   = days
+*/
+
+void
+pgca_parse_int_units(int *i, char *unit, char* str_value)
+{
+    int parse_count;
+
+    unit[0] = '\0';
+    parse_count = sscanf(str_value, "%d%s", i, unit);
+
+    if (parse_count == 0)
+    {
+        /* elog report */
+    }
+    else if (parse_count == 1)
+    {
+        /* nothing to do here */
+    }
+    else /* count = 2 */
+    {
+        if (strcmp(unit, "B") == 0)
+            ; /* Nothing to do here */
+        else if (strcmp(unit, "kB") == 0)
+            *i = 1024;
+        else if (strcmp(unit, "MB") == 0)
+            *i = 1024 * 1024;
+        else if (strcmp(unit, "GB") == 0)
+            *i = 1024 * 1024 * 1024;
+        // else if (strcmp(unit, "TB") == 0)
+        //     *i = 1024 * 1024 * 1024 * 1024;
+    }
+}
+
+char *
+pgca_double_to_text(double d)
+{
+    char *str_value;
+    str_value = (char *) palloc0(MAXINT8LEN);
+
+    pg_snprintf(str_value, MAXINT8LEN, "%.3lf", d);
+
+    return str_value;
+}
+
+// char *
+// pgca_int_to_text(int i)
+// {
+//     char *str_value;
+//     str_value = (char *) palloc0(MAXINT8LEN);
+
+//     pg_ltoa(i, str_value);
+
+//     return str_value;
+// }
+
+char *
+pgca_int_unit_to_text(int i, char *unit)
+{
+    char *str_value;
+    str_value = (char *) palloc0(MAXINT8LEN + PGCA_MAX_UNIT_LEN);
+
+    if (strcmp(unit, "B") == 0)
+        ; /* Nothing to do here */
+    else if (strcmp(unit, "kB") == 0)
+        i = i / 1024;
+    else if (strcmp(unit, "MB") == 0)
+        i = i / (1024 * 1024);
+    else if (strcmp(unit, "GB") == 0)
+        i = i / (1024 * 1024 * 1024);
+    // else if (strcmp(unit, "TB") == 0)
+    //     i = i / (1024 * 1024 * 1024 * 1024);
+
+    pg_snprintf(str_value, MAXINT8LEN + PGCA_MAX_UNIT_LEN, "%d%s", i, unit);
+
+    return str_value;
+}
+
+char*
+SuggestedSharedBuffer(char *str_value)
+{
+    int i;
+    char units[64];
+
+    pgca_parse_int_units(&i, units, str_value);
+    i = sys_res.total_ram * 0.25;
+
+    return pgca_int_unit_to_text(i, units);
 }
